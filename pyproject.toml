@@ -1,6 +1,6 @@
 [project]
 name = "torch-wheel-index"
-version = "0.2.0"
+version = "0.2.1"
 description = "Discover and catalog PyTorch wheel availability across CUDA, ROCm, XPU, and CPU sub-indexes"
 readme = "README.md"
 authors = [
