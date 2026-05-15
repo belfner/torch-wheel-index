@@ -17,7 +17,12 @@ PYTORCH_INDEX_URL = "https://download.pytorch.org/whl"
 PREVIOUS_VERSIONS_URL = "https://pytorch.org/get-started/previous-versions/"
 
 _WHEEL_LINK_RE = re.compile(r">([^<>]+\.whl)<", re.IGNORECASE)
-_INSTALL_RE = re.compile(r"install torch==(\S+) torchvision==(\S+)(?: torchaudio==(\S+))?")
+# Each package is matched independently so token order and inter-token
+# whitespace in the install line do not matter. The lookbehind rejects a
+# preceding word character so `pytorch==` does not match `torch==`.
+_TORCH_RE = re.compile(r"(?<![\w-])torch==(\S+)")
+_TORCHVISION_RE = re.compile(r"(?<![\w-])torchvision==(\S+)")
+_TORCHAUDIO_RE = re.compile(r"(?<![\w-])torchaudio==(\S+)")
 
 
 async def fetch_wheel_filenames(
@@ -128,7 +133,9 @@ class _PreviousVersionsParser(HTMLParser):
     Tracks immediate children of the `pytorch-article`: h3 sets the current
     torch version, h4 with an id containing 'wheel' becomes the active
     subsection, h5 with an id containing 'osx' arms capture for the next
-    sibling div, whose text is recorded.
+    sibling div, whose text is recorded. The whole article is walked and
+    sections with a version below the cutoff are filtered out, so the parser
+    works regardless of the order versions appear on the page.
     """
 
     def __init__(self, cutoff_version: Version):
@@ -142,12 +149,9 @@ class _PreviousVersionsParser(HTMLParser):
         self._section: Version | None = None
         self._subsection_id: str | None = None
         self._read_next_div = False
-        self._stop = False
         self.install_texts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if self._stop:
-            return
         attrs_d = {k: v or "" for k, v in attrs}
         if not self._in_article:
             if tag == "article" and "pytorch-article" in attrs_d.get("class", ""):
@@ -181,9 +185,7 @@ class _PreviousVersionsParser(HTMLParser):
                         pass
                     else:
                         self._section = version
-                        if version < self._cutoff:
-                            self._stop = True
-            elif self._section is not None:
+            elif self._section is not None and self._section >= self._cutoff:
                 if top_tag == "h4":
                     self._subsection_id = attrs.get("id")
                 elif top_tag == "h5":
@@ -231,21 +233,22 @@ async def get_paired_versions(
     vision_pairs: dict[Version, Version] = {}
     audio_pairs: dict[Version, Version] = {}
     for text in parser.install_texts:
-        match = _INSTALL_RE.search(text)
-        if match is None:
+        torch_match = _TORCH_RE.search(text)
+        vision_match = _TORCHVISION_RE.search(text)
+        if torch_match is None or vision_match is None:
             continue
-        torch_str, vision_str, audio_str = match.groups()
         try:
-            torch_v = Version(torch_str)
+            torch_v = Version(torch_match.group(1))
         except InvalidVersion:
             continue
         try:
-            vision_pairs[torch_v] = Version(vision_str)
+            vision_pairs[torch_v] = Version(vision_match.group(1))
         except InvalidVersion:
             pass
-        if audio_str is not None:
+        audio_match = _TORCHAUDIO_RE.search(text)
+        if audio_match is not None:
             try:
-                audio_pairs[torch_v] = Version(audio_str)
+                audio_pairs[torch_v] = Version(audio_match.group(1))
             except InvalidVersion:
                 pass
     return vision_pairs, audio_pairs
