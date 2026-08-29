@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from html.parser import HTMLParser
+from urllib.parse import quote
 
 from packaging.utils import parse_wheel_filename
 from packaging.version import InvalidVersion
@@ -98,6 +99,36 @@ async def get_torch_sub_indexes(
     tasks = [_verify_sub_index(key, semaphore) for key in candidates]
     results = await asyncio.gather(*tasks)
     return [r for r in results if r is not None]
+
+
+async def fetch_wheel_metadata(
+    sub_index_url: str,
+    filename: str,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    """
+    Fetch a wheel's PEP 658 metadata sidecar.
+
+    Parameters
+    ----------
+    sub_index_url : str
+        Base URL of the sub-index holding the wheel.
+    filename : str
+        Wheel filename as listed in the package index.
+    semaphore : asyncio.Semaphore
+        Concurrency limiter.
+
+    Returns
+    -------
+    str
+        Decoded METADATA text, empty when the sidecar is absent.
+    """
+    url = f"{sub_index_url}/{quote(filename)}.metadata"
+    result = await fetch(url, semaphore)
+    if result.status != 200:
+        logger.debug("metadata fetch for %s returned %d", filename, result.status)
+        return ""
+    return result.text
 
 
 async def fetch_package_wheels(
