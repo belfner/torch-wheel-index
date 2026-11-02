@@ -10,7 +10,11 @@ from packaging.utils import parse_wheel_filename
 from packaging.version import InvalidVersion
 from packaging.version import Version
 
+from torch_wheel_index._client import MISSING_STATUSES
+from torch_wheel_index._client import ScrapeError
 from torch_wheel_index._client import fetch
+from torch_wheel_index._client import fetch_remote_wheel_metadata
+from torch_wheel_index._client import is_transient
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,7 @@ _TORCHAUDIO_RE = re.compile(r"(?<![\w-])torchaudio==(\S+)")
 async def fetch_wheel_filenames(
     index_url: str,
     semaphore: asyncio.Semaphore,
+    missing_ok: bool = False,
 ) -> list[str]:
     """
     Fetch a wheel directory listing and extract .whl filenames.
@@ -39,17 +44,25 @@ async def fetch_wheel_filenames(
         URL of the wheel index page.
     semaphore : asyncio.Semaphore
         Concurrency limiter.
+    missing_ok : bool, optional
+        Treat a listing that does not exist as empty, by default False.
 
     Returns
     -------
     list[str]
         List of .whl filenames in document order.
+
+    Raises
+    ------
+    ScrapeError
+        The listing could not be fetched, which leaves the catalog incomplete.
     """
     result = await fetch(index_url, semaphore)
-    if result.status != 200:
-        logger.warning("index fetch returned %d for %s", result.status, index_url)
+    if result.status == 200:
+        return _WHEEL_LINK_RE.findall(result.text)
+    if missing_ok and result.status in MISSING_STATUSES:
         return []
-    return _WHEEL_LINK_RE.findall(result.text)
+    raise ScrapeError(f"index fetch returned {result.status} for {index_url}")
 
 
 def _candidate_sub_index_keys(wheel_filenames: list[str]) -> set[str]:
@@ -69,6 +82,8 @@ async def _verify_sub_index(
     result = await fetch(url, semaphore)
     if result.status == 200:
         return url, sub_index_key
+    if is_transient(result.status):
+        raise ScrapeError(f"sub-index check returned {result.status} for {url}")
     return None
 
 
@@ -107,7 +122,7 @@ async def fetch_wheel_metadata(
     semaphore: asyncio.Semaphore,
 ) -> str:
     """
-    Fetch a wheel's PEP 658 metadata sidecar.
+    Fetch a wheel's core metadata from a sub-index.
 
     Parameters
     ----------
@@ -121,20 +136,44 @@ async def fetch_wheel_metadata(
     Returns
     -------
     str
-        Decoded METADATA text, empty when the sidecar is absent.
+        Decoded METADATA text, empty when it cannot be read.
     """
-    url = f"{sub_index_url}/{quote(filename)}.metadata"
-    result = await fetch(url, semaphore)
-    if result.status != 200:
-        logger.debug("metadata fetch for %s returned %d", filename, result.status)
-        return ""
-    return result.text
+    return await fetch_wheel_metadata_at(f"{sub_index_url}/{quote(filename)}", semaphore)
+
+
+async def fetch_wheel_metadata_at(url: str, semaphore: asyncio.Semaphore) -> str:
+    """
+    Fetch a wheel's core metadata from its URL.
+
+    Reads the PEP 658 sidecar when the index publishes one, and otherwise
+    reads METADATA out of the remote archive with byte-range requests.
+
+    Parameters
+    ----------
+    url : str
+        Absolute wheel URL.
+    semaphore : asyncio.Semaphore
+        Concurrency limiter.
+
+    Returns
+    -------
+    str
+        Decoded METADATA text, empty when neither route yields it.
+    """
+    result = await fetch(f"{url}.metadata", semaphore)
+    if result.status == 200:
+        return result.text
+    if is_transient(result.status):
+        raise ScrapeError(f"metadata sidecar fetch returned {result.status} for {url}")
+    logger.debug("no metadata sidecar for %s (%d); reading the archive", url, result.status)
+    return await fetch_remote_wheel_metadata(url, semaphore)
 
 
 async def fetch_package_wheels(
     sub_index_url: str,
     package: str,
     semaphore: asyncio.Semaphore,
+    missing_ok: bool = False,
 ) -> list[str]:
     """
     Fetch wheel filenames for a package within a sub-index.
@@ -147,6 +186,9 @@ async def fetch_package_wheels(
         Package name ('torch' or 'torchvision').
     semaphore : asyncio.Semaphore
         Concurrency limiter.
+    missing_ok : bool, optional
+        Treat a package the sub-index does not carry as empty, by default
+        False.
 
     Returns
     -------
@@ -154,7 +196,7 @@ async def fetch_package_wheels(
         Wheel filenames listed in the package index.
     """
     url = f"{sub_index_url}/{package}"
-    return await fetch_wheel_filenames(url, semaphore)
+    return await fetch_wheel_filenames(url, semaphore, missing_ok=missing_ok)
 
 
 class _PreviousVersionsParser(HTMLParser):
@@ -254,6 +296,8 @@ async def get_paired_versions(
         lines omit the torchaudio token.
     """
     result = await fetch(PREVIOUS_VERSIONS_URL, semaphore)
+    if is_transient(result.status):
+        raise ScrapeError(f"previous-versions fetch returned {result.status}")
     if result.status != 200:
         logger.warning("previous-versions fetch returned %d", result.status)
         return {}, {}

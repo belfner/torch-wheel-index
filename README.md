@@ -7,6 +7,11 @@ Scrapes `download.pytorch.org/whl/` and turns it into a catalog you can query fo
 - Discovers every PyTorch sub-index (CUDA, ROCm, XPU, CPU) by parsing local-version tags.
 - Collects `torch` and `torchvision` wheels with version, compute backend, Python version, and platform.
 - Pairs each torch release with its matching `torchvision` version (scraped from the official compatibility table) and chooses a `torchaudio` version per release: the newest torchaudio wheel the release's own sub-index serves for its Python version and platform whose declared `torch` requirement accepts that release, falling back to the default registry when the sub-index has none. Each torchaudio version's requirements come from its PEP 658 metadata sidecar, with the official table as the fallback for versions published without one.
+- Reports, per release, the dependencies only its own sub-index serves at the required version (`triton-xpu`, `triton-rocm`, `pytorch-triton-rocm`, `rocm` and its `rocm-sdk-*` packages), walking them transitively through wheel metadata and static sdist PKG-INFO. A uv project with an explicit PyTorch index has to list these as direct dependencies routed to that index.
+- Reads wheel metadata from PEP 658 sidecars, and from inside the remote wheel with HTTP range requests when an index publishes no sidecar.
+- Skips sub-indexes with an unrecognized compute backend and wheels with an unrecognized platform tag, logging each.
+- Retries transient fetch failures with backoff; a fetch that keeps failing raises `ScrapeError` and leaves the cache file untouched, so a partial scrape never replaces a complete catalog.
+- `check_cache_async` returns a `CacheStatus` listing every reason a cache is stale (schema, covered cutoff, age measured from the catalog's own `generated_at`, and newer torch, torchvision, or torchaudio online); `refresh_if_stale` and `torch-wheel-index check` share it.
 - Programmatic API and CLI. CLI prints text or JSON.
 - One runtime dependency: `packaging`.
 
@@ -189,8 +194,10 @@ Frozen dataclass holding the release list, the torch-to-torchvision pairing map,
 
 - **`releases`**: List of `PackageInstance`. Sorted on construction.
 - **`torchvision_pairs`**: `dict[Version, Version]` mapping torch to torchvision.
+- **`torchvision_choices`**: `dict[PackageInstance, PackageChoice]` mapping each release to its paired torchvision `version` and the `index_url` serving a wheel of it for that release's Python version and platform (an empty string means the default registry). Releases with no such wheel anywhere are absent.
 - **`torchaudio_pairs`**: `dict[Version, Version]` mapping torch to the newest torchaudio chosen for any of its releases.
-- **`torchaudio_choices`**: `dict[PackageInstance, TorchaudioChoice]` mapping each release to its torchaudio `version` and the `index_url` serving it (an empty string means the default registry).
+- **`index_dependencies`**: `dict[PackageInstance, tuple[IndexDependency, ...]]` mapping each release to the dependencies only its index serves; each `IndexDependency` carries `name`, `requirement` (PEP 508 without marker), and `marker` (single-quoted, empty when unconditional).
+- **`torchaudio_choices`**: `dict[PackageInstance, PackageChoice]` mapping each release to its torchaudio `version` and the `index_url` serving it (an empty string means the default registry).
 
 #### Methods
 
@@ -206,7 +213,8 @@ Frozen dataclass holding the release list, the torch-to-torchvision pairing map,
 - **`newest_torchaudio_version()`**: Highest torchaudio version chosen for any release.
 - **`torchvision_for(torch_version)`**: Paired torchvision `Version`, or `None`.
 - **`torchaudio_for(torch_version)`**: Newest torchaudio `Version` chosen for any release of that torch version, or `None`.
-- **`torchaudio_choice(release)`**: The `TorchaudioChoice` for one release, or `None` when no scraped index carries a compatible wheel.
+- **`torchvision_choice(release)`**: The `PackageChoice` for torchvision on one release, or `None` when no index carries a wheel for its Python version and platform.
+- **`torchaudio_choice(release)`**: The `PackageChoice` for one release, or `None` when no scraped index carries a compatible wheel.
 - **`torchaudio_index_url(release)`**: The release's index URL when it serves the chosen torchaudio, otherwise an empty string.
 
 ### `PackageInstance`

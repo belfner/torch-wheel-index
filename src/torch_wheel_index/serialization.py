@@ -12,10 +12,11 @@ from packaging.version import Version
 
 from torch_wheel_index.models import Catalog
 from torch_wheel_index.models import ComputeType
+from torch_wheel_index.models import IndexDependency
+from torch_wheel_index.models import PackageChoice
 from torch_wheel_index.models import PackageInstance
-from torch_wheel_index.models import SCHEMA_VERSION
 from torch_wheel_index.models import Platform
-from torch_wheel_index.models import TorchaudioChoice
+from torch_wheel_index.models import SCHEMA_VERSION
 
 T = TypeVar("T")
 
@@ -34,6 +35,8 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
         for its python version and platform. torchaudio_index_url holds the
         release's index URL when that index serves the chosen version, and an
         empty string when torchaudio comes from the default registry.
+        index_dependencies lists the dependencies only the release's index
+        serves, each as {name, requirement, marker}.
       - 'unique_values': dropdown-friendly distinct values, with compute_version
         nested under compute_type.
 
@@ -47,14 +50,9 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
     dict[str, Any]
         Schema-conformant dict ready for json.dump.
     """
-    all_releases: list[dict[str, str]] = []
-    fallback_vision = ""
-    if len(catalog.torchvision_pairs) > 0:
-        fallback_vision = str(max(catalog.torchvision_pairs.values()))
-
+    all_releases: list[dict[str, Any]] = []
     for release in catalog.releases:
-        paired_vision = catalog.torchvision_pairs.get(release.version)
-        torchvision_str = str(paired_vision) if paired_vision is not None else fallback_vision
+        vision_choice = catalog.torchvision_choice(release)
         audio_choice = catalog.torchaudio_choice(release)
         all_releases.append(
             {
@@ -64,9 +62,14 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
                 "python_version": str(release.python_version),
                 "platform": release.platform.name,
                 "index_url": release.index_url,
-                "torchvision_version": torchvision_str,
+                "torchvision_version": str(vision_choice.version) if vision_choice is not None else "",
+                "torchvision_index_url": vision_choice.index_url if vision_choice is not None else "",
                 "torchaudio_version": str(audio_choice.version) if audio_choice is not None else "",
                 "torchaudio_index_url": audio_choice.index_url if audio_choice is not None else "",
+                "index_dependencies": [
+                    {"name": dep.name, "requirement": dep.requirement, "marker": dep.marker}
+                    for dep in catalog.index_dependencies.get(release, ())
+                ],
             }
         )
 
@@ -80,6 +83,8 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "torchaudio_latest": str(catalog.torchaudio_latest) if catalog.torchaudio_latest is not None else "",
+        "cutoff_version": str(catalog.cutoff_version) if catalog.cutoff_version is not None else "",
+        "generated_at": catalog.generated_at,
         "all_releases": all_releases,
         "unique_values": {
             "compute_type": _stable_unique(r.compute_type.name for r in catalog.releases),
@@ -108,15 +113,24 @@ def catalog_from_dict(data: dict[str, Any]) -> Catalog:
     Raises
     ------
     ValueError
-        When the input is missing required keys.
+        When the input is missing required keys or holds malformed values.
     """
+    try:
+        return _catalog_from_dict(data)
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"malformed catalog: {exc!r}") from exc
+
+
+def _catalog_from_dict(data: dict[str, Any]) -> Catalog:
     if "all_releases" not in data:
         raise ValueError("missing 'all_releases' key")
 
     releases: list[PackageInstance] = []
     vision_pairs: dict[Version, Version] = {}
+    vision_choices: dict[PackageInstance, PackageChoice] = {}
     audio_pairs: dict[Version, Version] = {}
-    audio_choices: dict[PackageInstance, TorchaudioChoice] = {}
+    audio_choices: dict[PackageInstance, PackageChoice] = {}
+    index_dependencies: dict[PackageInstance, tuple[IndexDependency, ...]] = {}
 
     for entry in data["all_releases"]:
         version = Version(entry["version"])
@@ -132,38 +146,62 @@ def catalog_from_dict(data: dict[str, Any]) -> Catalog:
 
         torchvision_str = entry.get("torchvision_version")
         if torchvision_str:
-            vision_pairs[version] = Version(torchvision_str)
+            vision_version = Version(torchvision_str)
+            vision_pairs[version] = vision_version
+            vision_choices[instance] = PackageChoice(
+                version=vision_version,
+                index_url=entry.get("torchvision_index_url") or "",
+            )
         torchaudio_str = entry.get("torchaudio_version")
         if torchaudio_str:
             audio_version = Version(torchaudio_str)
-            audio_choices[instance] = TorchaudioChoice(
+            audio_choices[instance] = PackageChoice(
                 version=audio_version,
                 index_url=entry.get("torchaudio_index_url") or "",
             )
             if version not in audio_pairs or audio_version > audio_pairs[version]:
                 audio_pairs[version] = audio_version
+        dependencies = tuple(
+            IndexDependency(name=dep["name"], requirement=dep["requirement"], marker=dep.get("marker", ""))
+            for dep in entry.get("index_dependencies") or []
+        )
+        if len(dependencies) > 0:
+            index_dependencies[instance] = dependencies
 
     latest_str = data.get("torchaudio_latest")
     torchaudio_latest = Version(latest_str) if latest_str else None
     if torchaudio_latest is None and len(audio_pairs) > 0:
         torchaudio_latest = max(audio_pairs.values())
 
+    cutoff_str = data.get("cutoff_version")
+
     return Catalog(
         releases=releases,
         torchvision_pairs=vision_pairs,
+        torchvision_choices=vision_choices,
         torchaudio_pairs=audio_pairs,
         torchaudio_choices=audio_choices,
+        index_dependencies=index_dependencies,
         torchaudio_latest=torchaudio_latest,
+        cutoff_version=Version(cutoff_str) if cutoff_str else None,
+        generated_at=float(data["generated_at"]) if data.get("generated_at") is not None else None,
         schema_version=int(data.get("schema_version", 0)),
     )
 
 
-def save_catalog(catalog: Catalog, path: Path) -> None:
+DEFAULT_CATALOG_MODE = 0o644
+"""Permissions for a written catalog: readable by a web server running as another user."""
+
+
+def save_catalog(catalog: Catalog, path: Path, mode: int = DEFAULT_CATALOG_MODE) -> None:
     """
     Atomically write a Catalog to `path` as JSON.
 
     Writes to a temp file in the same directory, then `os.replace` to swap
-    into place so concurrent readers never see a half-written file.
+    into place so concurrent readers never see a half-written file. The temp
+    file takes its final permissions before the swap, so readers of a shared
+    cache (nginx serving it from a volume as another user) keep access across
+    refreshes, including caches an earlier release wrote as 0600.
 
     Parameters
     ----------
@@ -171,6 +209,8 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         Catalog to write.
     path : Path
         Destination file path. Parent directory is created if missing.
+    mode : int, optional
+        Permission bits for the written file, by default `DEFAULT_CATALOG_MODE`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = catalog_to_dict(catalog)
@@ -179,6 +219,7 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+        tmp_path.chmod(mode)
         tmp_path.replace(path)
     except Exception:
         tmp_path.unlink(missing_ok=True)

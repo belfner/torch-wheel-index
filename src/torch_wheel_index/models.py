@@ -77,19 +77,46 @@ def _coerce_platform(value: str | Platform | None) -> Platform | None:
     return Platform[value.upper()]
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 """Current version of the `pytorch_info.json` schema."""
 
 
 @dataclass(frozen=True, eq=True)
-class TorchaudioChoice:
+class IndexDependency:
     """
-    The torchaudio requirement that installs alongside one torch release.
+    A dependency of a torch release that only the release's own index serves.
+
+    torch wheels on some sub-indexes depend on packages the default registry
+    lacks at the required version (torch+xpu on `triton-xpu`, torch+rocm10.0
+    on `rocm` and its `rocm-sdk-*` packages). An explicit index serves only
+    the packages a project routes to it, and uv routes direct dependencies
+    only, so each of these becomes a direct requirement routed to the index.
+
+    Parameters
+    ----------
+    name : str
+        Normalized project name.
+    requirement : str
+        PEP 508 requirement without its marker (e.g., 'triton-xpu~=3.9.0').
+    marker : str
+        PEP 508 marker the requirement carries, with single-quoted values, or
+        an empty string when it applies unconditionally.
+    """
+
+    name: str
+    requirement: str
+    marker: str
+
+
+@dataclass(frozen=True, eq=True)
+class PackageChoice:
+    """
+    A companion package version (torchvision, torchaudio) for one torch release.
 
     Parameters
     ----------
     version : Version
-        torchaudio version to pin.
+        Version to pin.
     index_url : str
         Sub-index URL serving that version for the release's python version
         and platform, which is always the release's own index. An empty
@@ -118,19 +145,35 @@ class Catalog:
         python_version desc, platform asc.
     torchvision_pairs : dict[Version, Version]
         Map of torch version to paired torchvision version.
+    torchvision_choices : dict[PackageInstance, PackageChoice]
+        Map of release to its paired torchvision version and the index
+        serving a wheel of it for the release's python version and platform.
+        Releases with no such wheel on any index are absent (torchvision
+        0.20.1 ships no CPython 3.13 wheel while torch 2.5.1 does).
     torchaudio_pairs : dict[Version, Version]
         Map of torch version to the newest torchaudio version chosen for any
         of its releases. A summary for version lookups; per-release answers
         live in `torchaudio_choices`.
-    torchaudio_choices : dict[PackageInstance, TorchaudioChoice]
+    torchaudio_choices : dict[PackageInstance, PackageChoice]
         Map of release to the torchaudio version that installs alongside it
         and the index serving that version. Sub-indexes carry different
         torchaudio versions and build matrices (cu130 serves 2.11.0 wheels per
         CPython version while cu132 serves only the 2.11.1 `py3-none` wheel),
         so the choice is made per release rather than per torch version.
+    index_dependencies : dict[PackageInstance, tuple[IndexDependency, ...]]
+        Map of release to the dependencies only its own index serves,
+        including transitive ones, read from wheel and sdist metadata.
+        Releases whose dependencies all resolve from the default registry are
+        absent.
     torchaudio_latest : Version | None
         Newest torchaudio version observed across the sub-indexes, which is
         what freshness checks compare against.
+    cutoff_version : Version | None
+        Minimum torch version the scrape covered, None when unknown.
+    generated_at : float | None
+        Unix time the scrape finished, None when unknown. Freshness checks
+        measure age from it, since copying or checking out a cache file
+        resets its modification time.
     schema_version : int
         Version of the JSON schema this catalog was loaded from. A freshly
         scraped catalog carries `SCHEMA_VERSION`.
@@ -138,9 +181,13 @@ class Catalog:
 
     releases: list[PackageInstance] = field(default_factory=list)
     torchvision_pairs: dict[Version, Version] = field(default_factory=dict)
+    torchvision_choices: dict[PackageInstance, PackageChoice] = field(default_factory=dict)
     torchaudio_pairs: dict[Version, Version] = field(default_factory=dict)
-    torchaudio_choices: dict[PackageInstance, TorchaudioChoice] = field(default_factory=dict)
+    torchaudio_choices: dict[PackageInstance, PackageChoice] = field(default_factory=dict)
+    index_dependencies: dict[PackageInstance, tuple[IndexDependency, ...]] = field(default_factory=dict)
     torchaudio_latest: Version | None = None
+    cutoff_version: Version | None = None
+    generated_at: float | None = None
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -274,7 +321,25 @@ class Catalog:
             return None
         return self.torchvision_pairs.get(v)
 
-    def torchaudio_choice(self, release: PackageInstance) -> TorchaudioChoice | None:
+    def torchvision_choice(self, release: PackageInstance) -> PackageChoice | None:
+        """
+        Return the torchvision requirement that installs alongside a release.
+
+        Parameters
+        ----------
+        release : PackageInstance
+            Release whose torchvision requirement is being looked up.
+
+        Returns
+        -------
+        PackageChoice or None
+            The paired torchvision version and the index serving it, or None
+            when no scraped index carries a wheel of it for the release's
+            python version and platform.
+        """
+        return self.torchvision_choices.get(release)
+
+    def torchaudio_choice(self, release: PackageInstance) -> PackageChoice | None:
         """
         Return the torchaudio requirement that installs alongside a release.
 
@@ -285,7 +350,7 @@ class Catalog:
 
         Returns
         -------
-        TorchaudioChoice or None
+        PackageChoice or None
             The torchaudio version and the index serving it, or None when no
             scraped index carries a torchaudio wheel that accepts this torch
             version on the release's python version and platform.

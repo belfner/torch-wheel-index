@@ -11,7 +11,6 @@ from pathlib import Path
 
 from packaging.version import Version
 
-from torch_wheel_index._client import make_semaphore
 from torch_wheel_index.models import Catalog
 from torch_wheel_index.models import ComputeType
 from torch_wheel_index.models import PackageInstance
@@ -19,7 +18,7 @@ from torch_wheel_index.models import Platform
 from torch_wheel_index.paths import default_cache_dir
 from torch_wheel_index.paths import default_cache_path
 from torch_wheel_index.pipeline import DEFAULT_CUTOFF_VERSION
-from torch_wheel_index.pipeline import _latest_at_main_index
+from torch_wheel_index.pipeline import check_cache_async
 from torch_wheel_index.pipeline import fetch_catalog_async
 from torch_wheel_index.pipeline import refresh_if_stale_async
 from torch_wheel_index.serialization import catalog_to_dict
@@ -61,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser(
         "check",
         help="Compare the cached catalog against the live index. Exits 1 if stale.",
+    )
+    check.add_argument(
+        "--cutoff",
+        default=str(DEFAULT_CUTOFF_VERSION),
+        help="Minimum torch version the cache must cover (default: %(default)s).",
     )
     _add_cache_args(check)
     _add_format_arg(check)
@@ -178,53 +182,33 @@ def _cmd_check(args: argparse.Namespace) -> int:
             print(f"no cache at {cache_path}", file=sys.stderr)
         return 1
 
-    catalog = load_catalog(cache_path)
-    sem = make_semaphore()
-    latest_torch, latest_vision = asyncio.run(_check_latest(sem))
-
-    cached_torch = catalog.newest_version()
-    try:
-        cached_vision = catalog.newest_torchvision_version()
-    except ValueError:
-        cached_vision = Version("0.0.0")
-
-    stale_torch = latest_torch is not None and latest_torch > cached_torch
-    stale_vision = latest_vision is not None and latest_vision > cached_vision
-    stale = stale_torch or stale_vision
+    status = asyncio.run(check_cache_async(cache_path, Version(args.cutoff)))
 
     if args.format == "json":
         payload = {
-            "cached": True,
+            "cached": status.catalog is not None,
             "path": str(cache_path),
-            "stale": stale,
-            "torch": {
-                "cached": str(cached_torch),
-                "online": str(latest_torch) if latest_torch is not None else None,
-                "stale": stale_torch,
-            },
-            "torchvision": {
-                "cached": str(cached_vision),
-                "online": str(latest_vision) if latest_vision is not None else None,
-                "stale": stale_vision,
+            "stale": status.stale,
+            "reasons": list(status.reasons),
+            **{
+                name: {
+                    "cached": str(status.cached[name]) if status.cached[name] is not None else None,
+                    "online": str(status.online[name]) if status.online[name] is not None else None,
+                }
+                for name in status.cached
             },
         }
         json.dump(payload, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
-        print(f"torch:        cached={cached_torch}  online={latest_torch}  {'STALE' if stale_torch else 'ok'}")
-        print(
-            f"torchvision:  cached={cached_vision}  online={latest_vision}  {'STALE' if stale_vision else 'ok'}",
-        )
+        for name in status.cached:
+            print(f"{name + ':':<13} cached={status.cached[name]}  online={status.online[name]}")
+        for reason in status.reasons:
+            print(f"STALE: {reason}")
+        if not status.stale:
+            print("ok")
 
-    return 1 if stale else 0
-
-
-async def _check_latest(sem: asyncio.Semaphore) -> tuple[Version | None, Version | None]:
-    torch_v, vision_v = await asyncio.gather(
-        _latest_at_main_index("torch", sem),
-        _latest_at_main_index("torchvision", sem),
-    )
-    return torch_v, vision_v
+    return 1 if status.stale else 0
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -295,6 +279,10 @@ def _cmd_find(args: argparse.Namespace) -> int:
                 ),
                 "torchaudio_version": _audio_version_str(catalog, m) or None,
                 "torchaudio_index_url": catalog.torchaudio_index_url(m) or None,
+                "index_dependencies": [
+                    f"{dep.requirement}; {dep.marker}" if dep.marker != "" else dep.requirement
+                    for dep in catalog.index_dependencies.get(m, ())
+                ],
             }
             for m in matches
         ]
