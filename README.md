@@ -6,7 +6,7 @@ Scrapes `download.pytorch.org/whl/` and turns it into a catalog you can query fo
 
 - Discovers every PyTorch sub-index (CUDA, ROCm, XPU, CPU) by parsing local-version tags.
 - Collects `torch` and `torchvision` wheels with version, compute backend, Python version, and platform.
-- Pairs each torch release with its matching `torchvision` and `torchaudio` versions (scraped from the official compatibility table). The cache only stores wheel data for `torch`; `torchaudio` versions come from the pairing table.
+- Pairs each torch release with its matching `torchvision` version (scraped from the official compatibility table) and chooses a `torchaudio` version per release: the newest torchaudio wheel the release's own sub-index serves for its Python version and platform whose declared `torch` requirement accepts that release, falling back to the default registry when the sub-index has none. Each torchaudio version's requirements come from its PEP 658 metadata sidecar, with the official table as the fallback for versions published without one.
 - Programmatic API and CLI. CLI prints text or JSON.
 - One runtime dependency: `packaging`.
 
@@ -71,6 +71,10 @@ from torch_wheel_index import get_catalog
 catalog = get_catalog()
 print(catalog.torchvision_for("2.5.0"))
 print(catalog.torchaudio_for("2.5.0"))
+
+# torchaudio varies by sub-index past torch 2.11, so look it up per release
+release = catalog.find(version="2.15.0", compute_type="CUDA", compute_version="13.2")[0]
+print(catalog.torchaudio_choice(release))
 ```
 
 ### Force a Fresh Fetch
@@ -179,13 +183,14 @@ refresh_if_stale(cache_path: Path, cutoff_version: Version = Version("2.0.0"), f
 
 ### `Catalog`
 
-Frozen dataclass holding the release list and the torch-to-torchvision and torch-to-torchaudio pairing maps.
+Frozen dataclass holding the release list, the torch-to-torchvision pairing map, and the per-release torchaudio choices.
 
 #### Fields
 
 - **`releases`**: List of `PackageInstance`. Sorted on construction.
 - **`torchvision_pairs`**: `dict[Version, Version]` mapping torch to torchvision.
-- **`torchaudio_pairs`**: `dict[Version, Version]` mapping torch to torchaudio.
+- **`torchaudio_pairs`**: `dict[Version, Version]` mapping torch to the newest torchaudio chosen for any of its releases.
+- **`torchaudio_choices`**: `dict[PackageInstance, TorchaudioChoice]` mapping each release to its torchaudio `version` and the `index_url` serving it (an empty string means the default registry).
 
 #### Methods
 
@@ -198,9 +203,11 @@ Frozen dataclass holding the release list and the torch-to-torchvision and torch
 - **`platforms()`**: Unique platforms.
 - **`newest_version()`**: Highest torch version. Raises `ValueError` on an empty catalog.
 - **`newest_torchvision_version()`**: Highest torchvision version in the pairing map.
-- **`newest_torchaudio_version()`**: Highest torchaudio version in the pairing map.
+- **`newest_torchaudio_version()`**: Highest torchaudio version chosen for any release.
 - **`torchvision_for(torch_version)`**: Paired torchvision `Version`, or `None`.
-- **`torchaudio_for(torch_version)`**: Paired torchaudio `Version`, or `None`.
+- **`torchaudio_for(torch_version)`**: Newest torchaudio `Version` chosen for any release of that torch version, or `None`.
+- **`torchaudio_choice(release)`**: The `TorchaudioChoice` for one release, or `None` when no scraped index carries a compatible wheel.
+- **`torchaudio_index_url(release)`**: The release's index URL when it serves the chosen torchaudio, otherwise an empty string.
 
 ### `PackageInstance`
 

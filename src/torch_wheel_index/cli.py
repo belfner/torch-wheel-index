@@ -293,9 +293,8 @@ def _cmd_find(args: argparse.Namespace) -> int:
                 "torchvision_version": (
                     str(catalog.torchvision_pairs[m.version]) if m.version in catalog.torchvision_pairs else None
                 ),
-                "torchaudio_version": (
-                    str(catalog.torchaudio_pairs[m.version]) if m.version in catalog.torchaudio_pairs else None
-                ),
+                "torchaudio_version": _audio_version_str(catalog, m) or None,
+                "torchaudio_index_url": catalog.torchaudio_index_url(m) or None,
             }
             for m in matches
         ]
@@ -310,12 +309,16 @@ def _cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def _audio_version_str(catalog: Catalog, release: PackageInstance) -> str:
+    choice = catalog.torchaudio_choice(release)
+    return str(choice.version) if choice is not None else ""
+
+
 def _print_table(matches: list[PackageInstance], catalog: Catalog) -> None:
     headers = ["version", "compute", "cv", "python", "platform", "torchvision", "torchaudio", "index_url"]
     rows: list[list[str]] = []
     for m in matches:
         paired_vision = catalog.torchvision_pairs.get(m.version)
-        paired_audio = catalog.torchaudio_pairs.get(m.version)
         rows.append(
             [
                 str(m.version),
@@ -324,7 +327,7 @@ def _print_table(matches: list[PackageInstance], catalog: Catalog) -> None:
                 str(m.python_version),
                 m.platform.name,
                 str(paired_vision) if paired_vision is not None else "",
-                str(paired_audio) if paired_audio is not None else "",
+                _audio_version_str(catalog, m),
                 m.index_url,
             ]
         )

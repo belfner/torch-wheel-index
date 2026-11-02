@@ -4,6 +4,7 @@ from torch_wheel_index.models import Catalog
 from torch_wheel_index.models import ComputeType
 from torch_wheel_index.models import PackageInstance
 from torch_wheel_index.models import Platform
+from torch_wheel_index.models import TorchaudioChoice
 from torch_wheel_index.paths import default_cache_dir
 from torch_wheel_index.paths import default_cache_path
 from torch_wheel_index.pipeline import DEFAULT_CUTOFF_VERSION
@@ -24,6 +25,7 @@ __all__ = [
     "ComputeType",
     "PackageInstance",
     "Platform",
+    "TorchaudioChoice",
     "catalog_from_dict",
     "catalog_to_dict",
     "default_cache_dir",

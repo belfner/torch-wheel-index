@@ -120,12 +120,37 @@ def filter_wheels(
         _, version, _, tags = parse_wheel_filename(filename)
         if version < cutoff_version:
             continue
-        if version.local is not None:
-            if version.local == sub_index_key:
-                selected.append((version, tags))
-        elif "macosx" in next(iter(tags)).platform:
+        if wheel_matches_index(version, tags, sub_index_key):
             selected.append((version, tags))
     return selected
+
+
+def wheel_matches_index(version: Version, tags: frozenset[Tag], sub_index_key: str) -> bool:
+    """
+    Decide whether a wheel listed in a sub-index belongs to that sub-index.
+
+    Sub-indexes also list wheels built for other backends. A wheel with a
+    local version segment belongs to the sub-index named by that segment; a
+    wheel without one belongs when it targets macOS, whose wheels carry no
+    local tag.
+
+    Parameters
+    ----------
+    version : Version
+        Wheel version, with its local segment.
+    tags : frozenset[Tag]
+        Wheel tags.
+    sub_index_key : str
+        Sub-index key (e.g., 'cu118').
+
+    Returns
+    -------
+    bool
+        True when the wheel belongs to the sub-index.
+    """
+    if version.local is not None:
+        return version.local == sub_index_key
+    return "macosx" in next(iter(tags)).platform
 
 
 def build_package_instance(

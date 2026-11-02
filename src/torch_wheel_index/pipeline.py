@@ -3,18 +3,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from packaging.requirements import InvalidRequirement
 from packaging.requirements import Requirement
+from packaging.specifiers import InvalidSpecifier
 from packaging.specifiers import SpecifierSet
+from packaging.tags import Tag
+from packaging.utils import InvalidWheelFilename
 from packaging.utils import canonicalize_name
 from packaging.utils import parse_wheel_filename
+from packaging.version import InvalidVersion
 from packaging.version import Version
 
 from torch_wheel_index._client import make_semaphore
 from torch_wheel_index._parser import build_package_instance
+from torch_wheel_index._parser import cpython_tag_to_version
 from torch_wheel_index._parser import filter_wheels
+from torch_wheel_index._parser import parse_platform
+from torch_wheel_index._parser import wheel_matches_index
 from torch_wheel_index._scraper import PYTORCH_INDEX_URL
 from torch_wheel_index._scraper import fetch_package_wheels
 from torch_wheel_index._scraper import fetch_wheel_metadata
@@ -25,6 +33,7 @@ from torch_wheel_index.models import Catalog
 from torch_wheel_index.models import Platform
 from torch_wheel_index.models import SCHEMA_VERSION
 from torch_wheel_index.models import PackageInstance
+from torch_wheel_index.models import TorchaudioChoice
 from torch_wheel_index.paths import default_cache_path
 
 logger = logging.getLogger(__name__)
@@ -86,27 +95,22 @@ async def fetch_catalog_async(
 
     releases = _build_releases(sub_indexes, torch_listings, cutoff_version)
     vision_versions = _collect_wheel_versions(sub_indexes, vision_listings)
-    audio_coordinates, audio_versions, audio_samples = _collect_audio_inventory(sub_indexes, audio_listings)
-    forward_ok = False
-    forward_constraint: SpecifierSet | None = None
-    if len(audio_versions) > 0:
-        forward_ok, forward_constraint = await _audio_torch_constraint(audio_versions[0], audio_samples, sem)
+    audio_served, audio_samples = _collect_audio_inventory(sub_indexes, audio_listings)
+    audio_requirements = await _fetch_audio_requirements(audio_samples, sem)
     vision_pairs = _resolve_version_pairs(releases, vision_versions, official_vision_pairs)
-    audio_pairs = _resolve_audio_pairs(
-        releases,
-        audio_versions,
-        official_audio_pairs,
-        forward_ok,
-        forward_constraint,
-    )
+    audio_choices = _choose_torchaudio(releases, audio_served, audio_requirements, official_audio_pairs)
+    audio_pairs: dict[Version, Version] = {}
+    for release, choice in audio_choices.items():
+        if release.version not in audio_pairs or choice.version > audio_pairs[release.version]:
+            audio_pairs[release.version] = choice.version
 
-    logger.info("collected %d torch releases", len(releases))
+    logger.info("collected %d torch releases, %d with a torchaudio choice", len(releases), len(audio_choices))
     return Catalog(
         releases=releases,
         torchvision_pairs=vision_pairs,
         torchaudio_pairs=audio_pairs,
-        torchaudio_index_wheels=audio_coordinates,
-        torchaudio_latest=audio_versions[0] if len(audio_versions) > 0 else None,
+        torchaudio_choices=audio_choices,
+        torchaudio_latest=max(audio_samples) if len(audio_samples) > 0 else None,
     )
 
 
@@ -126,10 +130,63 @@ def _build_releases(
     return releases
 
 
+_AudioKey = tuple[Version | None, Platform]
+"""(python version, platform) a torchaudio wheel installs on. None stands for a `py3-none` wheel's any-version."""
+
+
+@dataclass(frozen=True)
+class _AudioRequirements:
+    """
+    Requirements a torchaudio release declares in its wheel metadata.
+
+    Parameters
+    ----------
+    torch : SpecifierSet | None
+        Intersection of the torch specifiers it declares, None when it
+        declares no torch requirement.
+    python : SpecifierSet | None
+        Its Requires-Python specifier, None when it declares none.
+    """
+
+    torch: SpecifierSet | None
+    python: SpecifierSet | None
+
+
+def _audio_wheel_keys(tags: frozenset[Tag]) -> set[_AudioKey]:
+    """
+    List the (python version, platform) keys a torchaudio wheel installs on.
+
+    torchaudio wheels up to 2.11.0 are built per CPython version (`cp313`);
+    2.11.1 ships one `py3-none` wheel per platform, which installs on every
+    python version its Requires-Python admits.
+
+    Parameters
+    ----------
+    tags : frozenset[Tag]
+        Wheel tags.
+
+    Returns
+    -------
+    set[_AudioKey]
+        Keys for the wheel, with None as the python version of a `py3` wheel.
+    """
+    keys: set[_AudioKey] = set()
+    for tag in tags:
+        try:
+            platform = parse_platform(tag.platform)
+        except ValueError:
+            continue
+        if tag.interpreter.startswith("cp"):
+            keys.add((cpython_tag_to_version(tag.interpreter), platform))
+        elif tag.interpreter.startswith("py3"):
+            keys.add((None, platform))
+    return keys
+
+
 def _collect_audio_inventory(
     sub_indexes: list[tuple[str, str]],
     listings: list[list[str]],
-) -> tuple[dict[str, set[tuple[Version, Version, Platform]]], list[Version], dict[Version, tuple[str, str]]]:
+) -> tuple[dict[str, dict[_AudioKey, set[Version]]], dict[Version, tuple[str, str]]]:
     """
     Record what torchaudio wheels each sub-index serves.
 
@@ -142,36 +199,32 @@ def _collect_audio_inventory(
 
     Returns
     -------
-    tuple[dict[str, set[tuple[Version, Version, Platform]]], list[Version], dict[Version, tuple[str, str]]]
-        Per-index wheel coordinates, all versions seen newest first, and one
-        (sub-index url, filename) sample per version for metadata lookups.
+    tuple[dict[str, dict[_AudioKey, set[Version]]], dict[Version, tuple[str, str]]]
+        Per-index map of (python version, platform) to the torchaudio versions
+        served there, and one (sub-index url, filename) sample per version for
+        metadata lookups.
     """
-    coordinates: dict[str, set[tuple[Version, Version, Platform]]] = {}
-    versions: set[Version] = set()
+    served: dict[str, dict[_AudioKey, set[Version]]] = {}
     samples: dict[Version, tuple[str, str]] = {}
-    cutoff = Version("0.0.0")
     for (url, key), filenames in zip(sub_indexes, listings, strict=True):
-        index_url = f"{PYTORCH_INDEX_URL}/{key}"
-        bucket = coordinates.setdefault(index_url, set())
-        by_version: dict[Version, str] = {}
+        bucket = served.setdefault(f"{PYTORCH_INDEX_URL}/{key}", {})
         for filename in filenames:
             try:
-                _, filename_version, _, _ = parse_wheel_filename(filename)
-            except Exception:
+                _, wheel_version, _, tags = parse_wheel_filename(filename)
+            except (InvalidWheelFilename, InvalidVersion):
                 continue
-            by_version.setdefault(Version(filename_version.base_version), filename)
-        for version, tags in filter_wheels(filenames, key, cutoff):
-            instance = build_package_instance(version, key, tags, PYTORCH_INDEX_URL)
-            bucket.add((instance.version, instance.python_version, instance.platform))
-            versions.add(instance.version)
-            if instance.version not in samples and instance.version in by_version:
-                samples[instance.version] = (url, by_version[instance.version])
-    return coordinates, sorted(versions, reverse=True), samples
+            if not wheel_matches_index(wheel_version, tags, key):
+                continue
+            version = Version(wheel_version.base_version)
+            for audio_key in _audio_wheel_keys(tags):
+                bucket.setdefault(audio_key, set()).add(version)
+            samples.setdefault(version, (url, filename))
+    return served, samples
 
 
-def _torch_constraint(metadata: str) -> SpecifierSet | None:
+def _parse_audio_requirements(metadata: str) -> _AudioRequirements:
     """
-    Extract a wheel's declared torch version constraint.
+    Extract the torch and python constraints from a torchaudio wheel's METADATA.
 
     Parameters
     ----------
@@ -180,44 +233,44 @@ def _torch_constraint(metadata: str) -> SpecifierSet | None:
 
     Returns
     -------
-    SpecifierSet | None
-        The union of every torch specifier the wheel declares, or None when it
-        declares no torch requirement at all.
+    _AudioRequirements
+        The declared torch specifier and Requires-Python specifier.
     """
-    constraint: SpecifierSet | None = None
+    torch: SpecifierSet | None = None
+    python: SpecifierSet | None = None
     for line in metadata.splitlines():
-        if not line.lower().startswith("requires-dist:"):
-            continue
-        try:
-            requirement = Requirement(line.split(":", 1)[1].strip())
-        except InvalidRequirement:
-            continue
-        if canonicalize_name(requirement.name) != "torch":
-            continue
-        constraint = requirement.specifier if constraint is None else constraint & requirement.specifier
-    return constraint
+        field_name, _, value = line.partition(":")
+        match field_name.strip().lower():
+            case "requires-dist":
+                try:
+                    requirement = Requirement(value.strip())
+                except InvalidRequirement:
+                    continue
+                if canonicalize_name(requirement.name) != "torch":
+                    continue
+                torch = requirement.specifier if torch is None else torch & requirement.specifier
+            case "requires-python":
+                try:
+                    python = SpecifierSet(value.strip())
+                except InvalidSpecifier:
+                    continue
+    return _AudioRequirements(torch=torch, python=python)
 
 
-async def _audio_torch_constraint(
-    latest_audio: Version,
+async def _fetch_audio_requirements(
     samples: dict[Version, tuple[str, str]],
     semaphore: asyncio.Semaphore,
-) -> tuple[bool, SpecifierSet | None]:
+) -> dict[Version, _AudioRequirements]:
     """
-    Read what torch versions the newest torchaudio wheel accepts.
+    Read the declared requirements of every torchaudio version.
 
-    torchaudio wheels up to 2.10 declare an exact torch requirement, which
-    confines them to the torch release they shipped with. 2.11.0 declares no
-    torch requirement at all, which is what lets it pair with later torch
-    releases. The wheel's PEP 658 metadata sidecar carries the answer, and the
-    declared specifier is evaluated per candidate torch version rather than
-    pattern-matched, so a range or compatible-release form constrains pairing
-    the same way an exact pin does.
+    torchaudio wheels up to 2.10 pin an exact torch version, 2.11.0 declares
+    no torch requirement, and 2.11.1 declares `torch>=2.11`. The PEP 658
+    metadata sidecar carries the answer for each version, so pairing follows
+    what the wheels declare.
 
     Parameters
     ----------
-    latest_audio : Version
-        Newest torchaudio version observed on the sub-indexes.
     samples : dict[Version, tuple[str, str]]
         One (sub-index url, wheel filename) per torchaudio version.
     semaphore : asyncio.Semaphore
@@ -225,20 +278,149 @@ async def _audio_torch_constraint(
 
     Returns
     -------
-    tuple[bool, SpecifierSet | None]
-        Whether the metadata was readable, and the torch specifier it declares
-        (None when it declares no torch requirement).
+    dict[Version, _AudioRequirements]
+        Requirements per torchaudio version whose metadata sidecar was
+        readable. Versions with an unreadable sidecar are absent.
     """
-    sample = samples.get(latest_audio)
-    if sample is None:
-        return False, None
-    metadata = await fetch_wheel_metadata(sample[0], sample[1], semaphore)
-    if len(metadata) == 0:
-        logger.info("no metadata sidecar for torchaudio %s; skipping forward pairing", latest_audio)
-        return False, None
-    constraint = _torch_constraint(metadata)
-    logger.info("torchaudio %s declares torch requirement: %s", latest_audio, constraint or "none")
-    return True, constraint
+    versions = list(samples)
+    texts = await asyncio.gather(*(fetch_wheel_metadata(*samples[v], semaphore) for v in versions))
+    requirements: dict[Version, _AudioRequirements] = {}
+    for version, text in zip(versions, texts, strict=True):
+        if len(text) == 0:
+            logger.info("no metadata sidecar for torchaudio %s; using the pairing table for it", version)
+            continue
+        requirements[version] = _parse_audio_requirements(text)
+    return requirements
+
+
+def _audio_accepts_torch(
+    audio_version: Version,
+    torch_version: Version,
+    requirements: _AudioRequirements | None,
+    official_pairs: dict[Version, Version],
+) -> bool:
+    """
+    Decide whether a torchaudio version installs alongside a torch version.
+
+    A declared torch specifier decides directly. A wheel declaring no torch
+    requirement supports the torch release it shipped with and every later
+    one, and torchaudio shares torch's major.minor numbering, so it accepts
+    torch versions from its own major.minor on. Without readable metadata the
+    official pairing table decides, and a torch version the table skips takes
+    the torchaudio release sharing its version number.
+
+    Parameters
+    ----------
+    audio_version : Version
+        Candidate torchaudio version.
+    torch_version : Version
+        Torch release version.
+    requirements : _AudioRequirements | None
+        The candidate's declared requirements, None when its metadata was
+        unreadable.
+    official_pairs : dict[Version, Version]
+        torch-to-torchaudio pairings scraped from the official table.
+
+    Returns
+    -------
+    bool
+        True when the pair installs together.
+    """
+    if requirements is None:
+        documented = official_pairs.get(torch_version)
+        if documented is not None:
+            return audio_version == documented
+        return audio_version == torch_version
+    if requirements.torch is not None:
+        return requirements.torch.contains(torch_version)
+    return torch_version >= Version(f"{audio_version.major}.{audio_version.minor}")
+
+
+def _newest_compatible_audio(
+    release: PackageInstance,
+    wheels: dict[_AudioKey, set[Version]],
+    requirements: dict[Version, _AudioRequirements],
+    official_pairs: dict[Version, Version],
+) -> Version | None:
+    """
+    Find the newest torchaudio version one index serves for a release.
+
+    Parameters
+    ----------
+    release : PackageInstance
+        Torch release being paired.
+    wheels : dict[_AudioKey, set[Version]]
+        The index's torchaudio versions per (python version, platform).
+    requirements : dict[Version, _AudioRequirements]
+        Declared requirements per torchaudio version.
+    official_pairs : dict[Version, Version]
+        torch-to-torchaudio pairings scraped from the official table.
+
+    Returns
+    -------
+    Version | None
+        Newest torchaudio version with a wheel for the release's python
+        version and platform that accepts the release's torch version, or None
+        when the index has none.
+    """
+    candidates = set(wheels.get((release.python_version, release.platform), set()))
+    for version in wheels.get((None, release.platform), set()):
+        declared = requirements.get(version)
+        if declared is None or declared.python is None or declared.python.contains(release.python_version):
+            candidates.add(version)
+    compatible = [
+        version
+        for version in candidates
+        if _audio_accepts_torch(version, release.version, requirements.get(version), official_pairs)
+    ]
+    return max(compatible, default=None)
+
+
+def _choose_torchaudio(
+    releases: list[PackageInstance],
+    served: dict[str, dict[_AudioKey, set[Version]]],
+    requirements: dict[Version, _AudioRequirements],
+    official_pairs: dict[Version, Version],
+) -> dict[PackageInstance, TorchaudioChoice]:
+    """
+    Choose the torchaudio requirement for every torch release.
+
+    A release takes the newest compatible torchaudio its own index serves for
+    its python version and platform, routed to that index. When its index has
+    none, it takes the newest compatible version any scraped index serves for
+    that coordinate, routed to the default registry, which publishes the same
+    torchaudio versions and build matrix.
+
+    Parameters
+    ----------
+    releases : list[PackageInstance]
+        Torch releases the catalog covers.
+    served : dict[str, dict[_AudioKey, set[Version]]]
+        Per-index torchaudio inventory from `_collect_audio_inventory`.
+    requirements : dict[Version, _AudioRequirements]
+        Declared requirements per torchaudio version.
+    official_pairs : dict[Version, Version]
+        torch-to-torchaudio pairings scraped from the official table.
+
+    Returns
+    -------
+    dict[PackageInstance, TorchaudioChoice]
+        Choice per release that has a compatible torchaudio anywhere.
+    """
+    choices: dict[PackageInstance, TorchaudioChoice] = {}
+    for release in releases:
+        own = _newest_compatible_audio(release, served.get(release.index_url, {}), requirements, official_pairs)
+        if own is not None:
+            choices[release] = TorchaudioChoice(version=own, index_url=release.index_url)
+            continue
+        elsewhere = [
+            found
+            for wheels in served.values()
+            if (found := _newest_compatible_audio(release, wheels, requirements, official_pairs)) is not None
+        ]
+        if len(elsewhere) > 0:
+            choices[release] = TorchaudioChoice(version=max(elsewhere), index_url="")
+    return choices
 
 
 def _collect_wheel_versions(
@@ -271,74 +453,6 @@ def _resolve_version_pairs(
         for torch_v in torch_versions:
             if torch_v not in pairs:
                 pairs[torch_v] = fallback
-
-    return pairs
-
-
-def _resolve_audio_pairs(
-    releases: list[PackageInstance],
-    audio_versions: list[Version],
-    official_pairs: dict[Version, Version],
-    forward_ok: bool,
-    forward_constraint: SpecifierSet | None,
-) -> dict[Version, Version]:
-    """
-    Extend the official torchaudio pairings past the documented torch range.
-
-    Torch versions the table lists keep its pairing, since torchaudio wheels
-    of that era require an exact torch version and the pairing is sometimes
-    offset (torch 2.0.1 goes with torchaudio 2.0.2). A version the table skips
-    takes the torchaudio wheel sharing its version number when one exists,
-    which is the pairing upstream ships for the same-version era. The newest
-    torchaudio wheel supports the torch release it shipped alongside and every
-    later one, so torch versions past the end of the table take it. A torch
-    version left unmatched stays absent so callers can emit an unpinned
-    torchaudio requirement. The same-version branch runs whenever wheels are
-    available, so a failed scrape of the official table still yields pairings.
-
-    The result says which torchaudio version goes with a torch version, not
-    where to get it; `Catalog.torchaudio_index_url` decides that per release.
-
-    Parameters
-    ----------
-    releases : list[PackageInstance]
-        Torch releases the catalog covers.
-    audio_versions : list[Version]
-        torchaudio wheel versions found on the sub-indexes, newest first.
-    official_pairs : dict[Version, Version]
-        torch-to-torchaudio pairings scraped from the official table.
-    forward_ok : bool
-        Whether the newest torchaudio wheel's metadata was readable, which is
-        what makes pairing it with undocumented torch versions safe.
-    forward_constraint : SpecifierSet | None
-        The torch specifier that wheel declares. Each candidate torch version
-        is evaluated against it; None means the wheel constrains nothing.
-
-    Returns
-    -------
-    dict[Version, Version]
-        Pairings for every torch version whose torchaudio version is known.
-    """
-    pairs: dict[Version, Version] = dict(official_pairs)
-    if len(audio_versions) == 0:
-        return pairs
-
-    available = set(audio_versions)
-    newest_documented = max(official_pairs) if len(official_pairs) > 0 else None
-    latest_audio = audio_versions[0]
-    if len(official_pairs) > 0:
-        latest_audio = max(latest_audio, max(official_pairs.values()))
-
-    for release in releases:
-        if release.version in pairs:
-            continue
-        if release.version in available:
-            pairs[release.version] = release.version
-            continue
-        if not forward_ok or newest_documented is None or release.version <= newest_documented:
-            continue
-        if forward_constraint is None or forward_constraint.contains(release.version):
-            pairs[release.version] = latest_audio
 
     return pairs
 

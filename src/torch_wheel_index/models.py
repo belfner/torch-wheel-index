@@ -77,8 +77,28 @@ def _coerce_platform(value: str | Platform | None) -> Platform | None:
     return Platform[value.upper()]
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Current version of the `pytorch_info.json` schema."""
+
+
+@dataclass(frozen=True, eq=True)
+class TorchaudioChoice:
+    """
+    The torchaudio requirement that installs alongside one torch release.
+
+    Parameters
+    ----------
+    version : Version
+        torchaudio version to pin.
+    index_url : str
+        Sub-index URL serving that version for the release's python version
+        and platform, which is always the release's own index. An empty
+        string means the release's index lacks a matching wheel and the
+        default registry supplies it.
+    """
+
+    version: Version
+    index_url: str
 
 
 @dataclass(frozen=True)
@@ -99,14 +119,15 @@ class Catalog:
     torchvision_pairs : dict[Version, Version]
         Map of torch version to paired torchvision version.
     torchaudio_pairs : dict[Version, Version]
-        Map of torch version to the torchaudio version recommended for it,
-        from the official compatibility table where it lists one and extended
-        forward with the newest torchaudio release beyond the table's range.
-    torchaudio_index_wheels : dict[str, set[tuple[Version, Version, Platform]]]
-        Map of sub-index URL to the (torchaudio version, python version,
-        platform) coordinates that index serves. Sub-indexes carry different
-        torchaudio build matrices, so this map decides whether a release can
-        source torchaudio from its own index.
+        Map of torch version to the newest torchaudio version chosen for any
+        of its releases. A summary for version lookups; per-release answers
+        live in `torchaudio_choices`.
+    torchaudio_choices : dict[PackageInstance, TorchaudioChoice]
+        Map of release to the torchaudio version that installs alongside it
+        and the index serving that version. Sub-indexes carry different
+        torchaudio versions and build matrices (cu130 serves 2.11.0 wheels per
+        CPython version while cu132 serves only the 2.11.1 `py3-none` wheel),
+        so the choice is made per release rather than per torch version.
     torchaudio_latest : Version | None
         Newest torchaudio version observed across the sub-indexes, which is
         what freshness checks compare against.
@@ -118,7 +139,7 @@ class Catalog:
     releases: list[PackageInstance] = field(default_factory=list)
     torchvision_pairs: dict[Version, Version] = field(default_factory=dict)
     torchaudio_pairs: dict[Version, Version] = field(default_factory=dict)
-    torchaudio_index_wheels: dict[str, set[tuple[Version, Version, Platform]]] = field(default_factory=dict)
+    torchaudio_choices: dict[PackageInstance, TorchaudioChoice] = field(default_factory=dict)
     torchaudio_latest: Version | None = None
     schema_version: int = SCHEMA_VERSION
 
@@ -218,7 +239,7 @@ class Catalog:
 
     def newest_torchaudio_version(self) -> Version:
         """
-        Return the newest torchaudio version known to the pairing map.
+        Return the newest torchaudio version chosen for any release.
 
         Returns
         -------
@@ -253,14 +274,27 @@ class Catalog:
             return None
         return self.torchvision_pairs.get(v)
 
+    def torchaudio_choice(self, release: PackageInstance) -> TorchaudioChoice | None:
+        """
+        Return the torchaudio requirement that installs alongside a release.
+
+        Parameters
+        ----------
+        release : PackageInstance
+            Release whose torchaudio requirement is being looked up.
+
+        Returns
+        -------
+        TorchaudioChoice or None
+            The torchaudio version and the index serving it, or None when no
+            scraped index carries a torchaudio wheel that accepts this torch
+            version on the release's python version and platform.
+        """
+        return self.torchaudio_choices.get(release)
+
     def torchaudio_available(self, release: PackageInstance) -> bool:
         """
-        Report whether any index serves torchaudio for a release's coordinate.
-
-        torchaudio's build matrix trails torch's, so a release can pair with a
-        torchaudio version that ships no wheel for the release's python version
-        or platform anywhere. Pinning it then fails on every index, including
-        the default registry, which publishes the same build matrix.
+        Report whether some index serves a compatible torchaudio for a release.
 
         Parameters
         ----------
@@ -270,27 +304,13 @@ class Catalog:
         Returns
         -------
         bool
-            True when some index carries the paired torchaudio version for this
-            release's python version and platform.
+            True when a torchaudio choice exists for this release.
         """
-        paired = self.torchaudio_pairs.get(release.version)
-        if paired is None:
-            return False
-        coordinate = (paired, release.python_version, release.platform)
-        return any(coordinate in coordinates for coordinates in self.torchaudio_index_wheels.values())
+        return release in self.torchaudio_choices
 
     def torchaudio_index_url(self, release: PackageInstance) -> str:
         """
-        Return the index URL a release can source its torchaudio from.
-
-        A sub-index serves torchaudio only for the wheels it actually carries,
-        and its torchaudio build matrix is narrower than its torch one: cu130
-        ships torch 2.13.0 for CPython 3.15 while its newest torchaudio stops
-        at 3.14, and cu129 ships torch 2.9.0 for Windows with no matching
-        torchaudio. Routing a pin at an index with no wheel for the release's
-        own python version and platform makes the install unresolvable, so
-        those releases report an empty string and leave torchaudio to the
-        default registry.
+        Return the index URL a release sources its torchaudio from.
 
         Parameters
         ----------
@@ -300,20 +320,21 @@ class Catalog:
         Returns
         -------
         str
-            The release's index URL when that index carries the paired
-            torchaudio version, otherwise an empty string.
+            The release's own index URL when that index carries the chosen
+            torchaudio wheel, otherwise an empty string, which leaves
+            torchaudio to the default registry.
         """
-        paired = self.torchaudio_pairs.get(release.version)
-        if paired is None:
+        choice = self.torchaudio_choices.get(release)
+        if choice is None:
             return ""
-        coordinates = self.torchaudio_index_wheels.get(release.index_url, set())
-        if (paired, release.python_version, release.platform) in coordinates:
-            return release.index_url
-        return ""
+        return choice.index_url
 
     def torchaudio_for(self, torch_version: str | Version) -> Version | None:
         """
-        Look up the paired torchaudio version for a given torch version.
+        Look up the newest torchaudio version chosen for a torch version.
+
+        Sub-indexes can serve different torchaudio versions for the same torch
+        release; `torchaudio_choice` gives the per-release answer.
 
         Parameters
         ----------
@@ -323,8 +344,8 @@ class Catalog:
         Returns
         -------
         Version or None
-            Paired torchaudio version, or None if the official compatibility
-            table does not list torchaudio for this torch version.
+            Newest torchaudio version chosen for any release of this torch
+            version, or None when none of its releases has a torchaudio choice.
         """
         v = _coerce_version(torch_version)
         if v is None:

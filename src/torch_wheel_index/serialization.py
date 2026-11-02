@@ -15,6 +15,7 @@ from torch_wheel_index.models import ComputeType
 from torch_wheel_index.models import PackageInstance
 from torch_wheel_index.models import SCHEMA_VERSION
 from torch_wheel_index.models import Platform
+from torch_wheel_index.models import TorchaudioChoice
 
 T = TypeVar("T")
 
@@ -28,10 +29,10 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
         the newest torchaudio version seen on the sub-indexes.
       - 'all_releases': per-release dicts with torchvision_version,
         torchaudio_version, and torchaudio_index_url attached.
-        torchaudio_version is an empty string when the pairing is unknown or
-        when no index carries that torchaudio version for the release's python
-        version and platform. torchaudio_index_url holds the release's
-        index URL when that index serves the paired torchaudio version, and an
+        torchaudio_version is the torchaudio version chosen for that release,
+        or an empty string when no scraped index carries a compatible wheel
+        for its python version and platform. torchaudio_index_url holds the
+        release's index URL when that index serves the chosen version, and an
         empty string when torchaudio comes from the default registry.
       - 'unique_values': dropdown-friendly distinct values, with compute_version
         nested under compute_type.
@@ -54,10 +55,7 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
     for release in catalog.releases:
         paired_vision = catalog.torchvision_pairs.get(release.version)
         torchvision_str = str(paired_vision) if paired_vision is not None else fallback_vision
-        paired_audio = catalog.torchaudio_pairs.get(release.version)
-        torchaudio_str = ""
-        if paired_audio is not None and catalog.torchaudio_available(release):
-            torchaudio_str = str(paired_audio)
+        audio_choice = catalog.torchaudio_choice(release)
         all_releases.append(
             {
                 "version": str(release.version),
@@ -67,8 +65,8 @@ def catalog_to_dict(catalog: Catalog) -> dict[str, Any]:
                 "platform": release.platform.name,
                 "index_url": release.index_url,
                 "torchvision_version": torchvision_str,
-                "torchaudio_version": torchaudio_str,
-                "torchaudio_index_url": catalog.torchaudio_index_url(release),
+                "torchaudio_version": str(audio_choice.version) if audio_choice is not None else "",
+                "torchaudio_index_url": audio_choice.index_url if audio_choice is not None else "",
             }
         )
 
@@ -118,7 +116,7 @@ def catalog_from_dict(data: dict[str, Any]) -> Catalog:
     releases: list[PackageInstance] = []
     vision_pairs: dict[Version, Version] = {}
     audio_pairs: dict[Version, Version] = {}
-    audio_wheels: dict[str, set[tuple[Version, Version, Platform]]] = {}
+    audio_choices: dict[PackageInstance, TorchaudioChoice] = {}
 
     for entry in data["all_releases"]:
         version = Version(entry["version"])
@@ -137,12 +135,13 @@ def catalog_from_dict(data: dict[str, Any]) -> Catalog:
             vision_pairs[version] = Version(torchvision_str)
         torchaudio_str = entry.get("torchaudio_version")
         if torchaudio_str:
-            paired_audio = Version(torchaudio_str)
-            audio_pairs[version] = paired_audio
-            audio_index_url = entry.get("torchaudio_index_url")
-            if audio_index_url:
-                coordinate = (paired_audio, instance.python_version, instance.platform)
-                audio_wheels.setdefault(audio_index_url, set()).add(coordinate)
+            audio_version = Version(torchaudio_str)
+            audio_choices[instance] = TorchaudioChoice(
+                version=audio_version,
+                index_url=entry.get("torchaudio_index_url") or "",
+            )
+            if version not in audio_pairs or audio_version > audio_pairs[version]:
+                audio_pairs[version] = audio_version
 
     latest_str = data.get("torchaudio_latest")
     torchaudio_latest = Version(latest_str) if latest_str else None
@@ -153,7 +152,7 @@ def catalog_from_dict(data: dict[str, Any]) -> Catalog:
         releases=releases,
         torchvision_pairs=vision_pairs,
         torchaudio_pairs=audio_pairs,
-        torchaudio_index_wheels=audio_wheels,
+        torchaudio_choices=audio_choices,
         torchaudio_latest=torchaudio_latest,
         schema_version=int(data.get("schema_version", 0)),
     )
